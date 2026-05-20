@@ -151,14 +151,37 @@ function makeSupa(url, anonKey) {
       return body[0] || row;
     },
 
-    async leaderboard(game, higherIsBetter, limit = 10) {
+    async leaderboard(game, higherIsBetter, limit = 25) {
       const order = higherIsBetter ? 'best.desc,plays.desc' : 'best.asc,plays.desc';
+      // 1) Top scores for this game (public read via RLS).
       const r = await fetch(
-        `${url}/rest/v1/scores?game=eq.${game}&order=${order}&limit=${limit}&select=best,plays,user_id,profiles(username)`,
+        `${url}/rest/v1/scores?game=eq.${game}&order=${order}&limit=${limit}&select=best,plays,user_id`,
         { headers: headers() }
       );
-      if (!r.ok) return [];
-      return await r.json();
+      if (!r.ok) {
+        console.error('leaderboard scores fetch failed', r.status, await r.text());
+        return [];
+      }
+      const rows = await r.json();
+      if (!rows.length) return [];
+
+      // 2) Resolve usernames in a second query, then stitch together.
+      // (scores and profiles both FK to auth.users, so there's no direct
+      // relationship for PostgREST to embed — we join manually instead.)
+      const ids = [...new Set(rows.map(x => x.user_id))];
+      const inList = ids.join(',');
+      let nameMap = {};
+      const pr = await fetch(
+        `${url}/rest/v1/profiles?id=in.(${inList})&select=id,username`,
+        { headers: headers() }
+      );
+      if (pr.ok) {
+        const profs = await pr.json();
+        for (const p of profs) nameMap[p.id] = p.username;
+      } else {
+        console.error('leaderboard profiles fetch failed', pr.status);
+      }
+      return rows.map(x => ({ ...x, profiles: { username: nameMap[x.user_id] || '???' } }));
     }
   };
   return api;
@@ -457,7 +480,9 @@ export default function App() {
         ) : !config ? (
           <SetupScreen onDone={onConfigured} />
         ) : !session || !profile ? (
-          <AuthScreen supa={supa} onLogin={onLogin} onOpenSettings={() => setShowSettings(true)} />
+          <AuthScreen supa={supa} onLogin={onLogin}
+            showConfigUI={!config.fromEnv}
+            onOpenSettings={() => setShowSettings(true)} />
         ) : route === 'leaderboard' ? (
           <Leaderboard supa={supa} profile={profile} onExit={() => setRoute('home')} />
         ) : route === 'home' ? (
@@ -465,13 +490,14 @@ export default function App() {
             profile={profile} scores={scores}
             onSelect={setRoute} onLogout={onLogout}
             onLeaderboard={() => setRoute('leaderboard')}
+            showConfigUI={!config.fromEnv}
             onSettings={() => setShowSettings(true)}
           />
         ) : (
           <GameRouter route={route} scores={scores} onExit={() => setRoute('home')} onScore={handleScore} />
         )}
 
-        {showSettings && (
+        {showSettings && !config.fromEnv && (
           <SettingsModal
             config={config}
             onClose={() => setShowSettings(false)}
@@ -877,7 +903,7 @@ function SettingsModal({ config, onClose, onReset }) {
    AUTH SCREEN
    ============================================================ */
 
-function AuthScreen({ supa, onLogin, onOpenSettings }) {
+function AuthScreen({ supa, onLogin, onOpenSettings, showConfigUI }) {
   const [mode, setMode] = useState('login');
   const [u, setU] = useState('');
   const [p, setP] = useState('');
@@ -932,11 +958,13 @@ function AuthScreen({ supa, onLogin, onOpenSettings }) {
           </div>
           <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', borderTop:`1px solid ${C.border}`, paddingTop:18, marginTop:24, fontSize:10, color:C.textDimmer, letterSpacing:2 }}>
             <span><span className="blink" style={{ color:C.lime }}>●</span> &nbsp; LIVE &nbsp; / &nbsp; V2.0</span>
-            <button onClick={() => { sfx.click(); onOpenSettings(); }}
-              onMouseEnter={sfx.hover}
-              style={{ background:'none', border:'none', color:C.textDimmer, cursor:'pointer', display:'inline-flex', alignItems:'center', gap:5 }}>
-              <Settings size={12}/> CONFIG
-            </button>
+            {showConfigUI && (
+              <button onClick={() => { sfx.click(); onOpenSettings(); }}
+                onMouseEnter={sfx.hover}
+                style={{ background:'none', border:'none', color:C.textDimmer, cursor:'pointer', display:'inline-flex', alignItems:'center', gap:5 }}>
+                <Settings size={12}/> CONFIG
+              </button>
+            )}
           </div>
         </div>
 
@@ -987,7 +1015,7 @@ function AuthScreen({ supa, onLogin, onOpenSettings }) {
    HOME SCREEN
    ============================================================ */
 
-function HomeScreen({ profile, scores, onSelect, onLogout, onLeaderboard, onSettings }) {
+function HomeScreen({ profile, scores, onSelect, onLogout, onLeaderboard, onSettings, showConfigUI }) {
   const totalPlays = Object.values(scores).reduce((s, x) => s + (x?.plays || 0), 0);
   const gamesPlayed = Object.keys(scores).length;
 
@@ -1011,10 +1039,12 @@ function HomeScreen({ profile, scores, onSelect, onLogout, onLeaderboard, onSett
             <span style={{ color:C.text, fontWeight:700 }}>{profile.username.toUpperCase()}</span>
           </div>
           <Btn kind="ghost" icon={Trophy} onClick={onLeaderboard}>Leaderboard</Btn>
-          <button onClick={() => { sfx.click(); onSettings(); }} onMouseEnter={sfx.hover}
-            style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.text, padding:'10px', cursor:'pointer' }}>
-            <Settings size={14}/>
-          </button>
+          {showConfigUI && (
+            <button onClick={() => { sfx.click(); onSettings(); }} onMouseEnter={sfx.hover}
+              style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.text, padding:'10px', cursor:'pointer' }}>
+              <Settings size={14}/>
+            </button>
+          )}
           <Btn kind="ghost" icon={LogOut} onClick={onLogout}>Out</Btn>
         </div>
       </header>
@@ -1269,34 +1299,45 @@ function GameShell({ game, onExit, best, children }) {
    GAME 1: COLOR HUNT
    ============================================================ */
 
+const CH_LIVES = 3;
+
 function ColorHunt({ onScore, accent }) {
   const [phase, setPhase] = useState('idle');
   const [round, setRound] = useState(0);
   const [time, setTime] = useState(60);
   const [grid, setGrid] = useState(null);
   const [finalScore, setFinalScore] = useState(0);
+  const [lives, setLives] = useState(CH_LIVES);
+  const [reason, setReason] = useState('');
+  const [shakeN, setShakeN] = useState(0);
   const tref = useRef(null);
 
   const buildRound = (r) => {
-    const size = clamp(2 + Math.floor(r / 2), 2, 7);
+    // Steeper ramp: grid grows faster (caps at 7x7) and the color gap shrinks
+    // hard, bottoming out near the threshold of human discrimination.
+    const size = clamp(3 + Math.floor(r / 1.8), 3, 7);
     const baseHue = randInt(0, 359);
-    const baseSat = randInt(45, 75);
-    const baseLight = randInt(40, 65);
-    const diff = clamp(34 - r * 1.6, 4, 34);
+    const baseSat = randInt(45, 80);
+    const baseLight = randInt(38, 66);
+    const diff = clamp(36 - r * 2.6, 2.5, 36);
     const axis = pick(['l', 's', 'h']);
     let base = `hsl(${baseHue} ${baseSat}% ${baseLight}%)`;
     let tgt;
-    if (axis === 'l') tgt = `hsl(${baseHue} ${baseSat}% ${clamp(baseLight + (Math.random() < 0.5 ? -diff/3 : diff/3), 10, 90)}%)`;
-    else if (axis === 's') tgt = `hsl(${baseHue} ${clamp(baseSat + (Math.random() < 0.5 ? -diff : diff), 10, 95)}% ${baseLight}%)`;
+    if (axis === 'l') tgt = `hsl(${baseHue} ${baseSat}% ${clamp(baseLight + (Math.random() < 0.5 ? -diff/2.6 : diff/2.6), 8, 92)}%)`;
+    else if (axis === 's') tgt = `hsl(${baseHue} ${clamp(baseSat + (Math.random() < 0.5 ? -diff : diff), 8, 96)}% ${baseLight}%)`;
     else tgt = `hsl(${(baseHue + (Math.random() < 0.5 ? -diff/2 : diff/2) + 360) % 360} ${baseSat}% ${baseLight}%)`;
     const idx = randInt(0, size * size - 1);
     return { size, base, target: tgt, idx };
   };
 
   const start = () => {
-    setRound(0); setTime(60); setFinalScore(0);
+    setRound(0); setTime(60); setFinalScore(0); setLives(CH_LIVES); setReason('');
     setGrid(buildRound(0));
     setPhase('playing');
+  };
+
+  const end = (r, why) => {
+    setFinalScore(r); setReason(why); onScore(r); setPhase('over');
   };
 
   useEffect(() => {
@@ -1312,10 +1353,9 @@ function ColorHunt({ onScore, accent }) {
   }, [phase]);
 
   useEffect(() => {
-    if (phase === 'playing' && time === 0) {
-      sfx.bad(); setFinalScore(round); onScore(round); setPhase('over');
-    }
-  }, [time, phase, round, onScore]);
+    if (phase === 'playing' && time === 0) { sfx.bad(); end(round, 'TIME UP'); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [time, phase]);
 
   const onTile = (i) => {
     if (phase !== 'playing') return;
@@ -1324,7 +1364,11 @@ function ColorHunt({ onScore, accent }) {
       const nr = round + 1;
       setRound(nr); setGrid(buildRound(nr));
     } else {
-      sfx.bad(); setFinalScore(round); onScore(round); setPhase('over');
+      const nl = lives - 1;
+      setLives(nl);
+      setShakeN(n => n + 1);
+      if (nl <= 0) { sfx.bad(); end(round, 'OUT OF LIVES'); }
+      else sfx.warn();
     }
   };
 
@@ -1332,12 +1376,12 @@ function ColorHunt({ onScore, accent }) {
     return <PrePlay accent={accent} icon={Eye} how={[
       'A grid of tiles. One is a slightly different shade.',
       'Click it. Click it fast.',
-      'Each correct pick: bigger grid, smaller difference.',
-      'You have 60 seconds. Wrong click ends the run.'
+      'Each correct pick: bigger grid, smaller difference. It ramps quickly.',
+      `You have 60 seconds and ${CH_LIVES} lives. A wrong click costs a life.`
     ]} onStart={start}/>;
   }
   if (phase === 'over') {
-    return <Result accent={accent} title="RUN OVER" lines={[['ROUNDS CLEARED', finalScore]]} onRetry={start}/>;
+    return <Result accent={accent} title={reason || 'RUN OVER'} lines={[['ROUNDS CLEARED', finalScore]]} onRetry={start}/>;
   }
 
   return (
@@ -1345,9 +1389,10 @@ function ColorHunt({ onScore, accent }) {
       <Hud accent={accent} items={[
         ['ROUND', round + 1],
         ['TIME', `${time}s`, time <= 6 ? C.pink : null],
+        ['LIVES', <LifePips key="lp" lives={lives} max={CH_LIVES}/>, lives === 1 ? C.pink : null],
         ['GRID', `${grid.size}×${grid.size}`]
       ]}/>
-      <div style={{
+      <div key={shakeN} className={shakeN ? 'shake' : ''} style={{
         display:'grid', gridTemplateColumns:`repeat(${grid.size}, 1fr)`,
         gap: clamp(10 - grid.size, 3, 8), maxWidth: 560, margin:'24px auto 0', aspectRatio:'1 / 1'
       }}>
@@ -1362,6 +1407,20 @@ function ColorHunt({ onScore, accent }) {
         ))}
       </div>
     </div>
+  );
+}
+
+function LifePips({ lives, max }) {
+  return (
+    <span style={{ display:'inline-flex', gap:5, justifyContent:'center' }}>
+      {Array.from({ length: max }).map((_, i) => (
+        <span key={i} style={{
+          width:12, height:12, borderRadius:'50%',
+          background: i < lives ? 'currentColor' : 'transparent',
+          border: `1.5px solid ${i < lives ? 'currentColor' : C.textDimmer}`
+        }}/>
+      ))}
+    </span>
   );
 }
 
@@ -1429,14 +1488,31 @@ function ChromaticRecall({ onScore, accent }) {
   const [target, setTarget] = useState({ r:0, g:0, b:0 });
   const [guess, setGuess] = useState({ r:128, g:128, b:128 });
   const [scores, setScores] = useState([]);
+  const [memCount, setMemCount] = useState(3);
   const ROUNDS = 5;
+  const MEM_SECONDS = 3;
 
   const newTarget = () => {
     const t = { r: randInt(20,235), g: randInt(20,235), b: randInt(20,235) };
     setTarget(t); setGuess({ r:128, g:128, b:128 });
+    setMemCount(MEM_SECONDS);
     setPhase('show');
-    setTimeout(() => setPhase('guess'), 2800);
   };
+
+  // Countdown while memorizing, then flip to the guess phase.
+  useEffect(() => {
+    if (phase !== 'show') return;
+    setMemCount(MEM_SECONDS);
+    const iv = setInterval(() => {
+      setMemCount(c => {
+        if (c <= 1) { clearInterval(iv); return 0; }
+        sfx.tick();
+        return c - 1;
+      });
+    }, 1000);
+    const to = setTimeout(() => setPhase('guess'), MEM_SECONDS * 1000);
+    return () => { clearInterval(iv); clearTimeout(to); };
+  }, [phase]);
 
   const start = () => { setScores([]); setRound(0); newTarget(); };
 
@@ -1491,8 +1567,16 @@ function ChromaticRecall({ onScore, accent }) {
             aspectRatio:'1 / 1',
             background: (phase === 'show' || phase === 'reveal') ? targetCss : C.bg3,
             border:`1px solid ${C.border}`,
-            display: phase === 'guess' ? 'grid' : 'block', placeItems:'center'
+            display:'grid', placeItems:'center', position:'relative'
           }}>
+            {phase === 'show' && (
+              <div style={{
+                fontFamily:FONT_DISPLAY, fontWeight:800, fontSize:72, lineHeight:1,
+                color:'rgba(0,0,0,0.55)', textShadow:'0 1px 12px rgba(255,255,255,0.35)'
+              }}>
+                {memCount}
+              </div>
+            )}
             {phase === 'guess' && <span style={{ color:C.textDimmer, letterSpacing:2, fontSize:11 }}>FROM MEMORY</span>}
           </div>
         </div>
@@ -1506,16 +1590,23 @@ function ChromaticRecall({ onScore, accent }) {
 
       {phase === 'guess' && (
         <div style={{ maxWidth: 560, margin:'24px auto 0', display:'flex', flexDirection:'column', gap:16 }}>
-          {[['R','r',C.pink],['G','g',C.lime],['B','b',C.cyan]].map(([lbl, k, col]) => (
-            <div key={k}>
-              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
-                <span style={{ fontSize:11, letterSpacing:2, color:col, fontWeight:700 }}>{lbl}</span>
-                <span style={{ fontFamily:FONT_MONO, fontSize:12, color:C.text }}>{guess[k]}</span>
+          {[['R','r',C.pink],['G','g',C.lime],['B','b',C.cyan]].map(([lbl, k, col]) => {
+            const { r, g, b } = guess;
+            const grad = k === 'r' ? `linear-gradient(90deg, rgb(0,${g},${b}), rgb(255,${g},${b}))`
+              : k === 'g' ? `linear-gradient(90deg, rgb(${r},0,${b}), rgb(${r},255,${b}))`
+              : `linear-gradient(90deg, rgb(${r},${g},0), rgb(${r},${g},255))`;
+            return (
+              <div key={k}>
+                <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
+                  <span style={{ fontSize:11, letterSpacing:2, color:col, fontWeight:700 }}>{lbl}</span>
+                  <span style={{ fontFamily:FONT_MONO, fontSize:12, color:C.text }}>{guess[k]}</span>
+                </div>
+                <input className="arc-slider" type="range" min={0} max={255} value={guess[k]}
+                  style={{ background: grad, height:14 }}
+                  onChange={e => setGuess(g => ({ ...g, [k]: +e.target.value }))}/>
               </div>
-              <input className="arc-slider" type="range" min={0} max={255} value={guess[k]}
-                onChange={e => setGuess(g => ({ ...g, [k]: +e.target.value }))}/>
-            </div>
-          ))}
+            );
+          })}
           <div style={{ aspectRatio:'4 / 1', background: guessCss, border:`1px solid ${C.border}`, marginTop:6 }}/>
           <Btn icon={Check} onClick={submit}>LOCK IN</Btn>
         </div>
@@ -1626,13 +1717,15 @@ function PitchPerfect({ onScore, accent }) {
 
       <div style={{ maxWidth:560, margin:'40px auto 0', textAlign:'center' }}>
         <div style={{ border:`1px solid ${C.border}`, background:C.bg2, padding:'32px 24px', marginBottom:24, position:'relative', overflow:'hidden' }}>
-          <WaveViz freq={phase === 'reveal' ? target : (phase === 'guess' ? guess : target)} accent={accent}/>
+          <WaveViz freq={phase === 'reveal' ? target : (phase === 'guess' ? guess : 540)} accent={accent}/>
           <div style={{ position:'relative', zIndex:1 }}>
             <div style={{ fontSize:10, letterSpacing:2, color:C.textDim, marginBottom:6 }}>
-              {phase === 'listen' ? 'TARGET FREQUENCY' : phase === 'guess' ? 'YOUR GUESS' : 'TARGET'}
+              {phase === 'listen' ? 'LISTEN CAREFULLY' : phase === 'guess' ? 'YOUR GUESS' : 'TARGET'}
             </div>
             <div style={{ fontFamily:FONT_DISPLAY, fontWeight:800, fontSize:58, letterSpacing:-2, color:accent, lineHeight:1 }}>
-              {phase === 'guess' ? guess : target}<span style={{ color:C.textDim, fontSize:24 }}> Hz</span>
+              {phase === 'listen'
+                ? <span className="blink" style={{ letterSpacing:6 }}>· · ·</span>
+                : <>{phase === 'guess' ? guess : target}<span style={{ color:C.textDim, fontSize:24 }}> Hz</span></>}
             </div>
             {phase === 'reveal' && (
               <div style={{ marginTop:16, color:C.textDim, fontSize:12, letterSpacing:1 }}>
