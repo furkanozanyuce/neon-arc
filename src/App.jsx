@@ -4,7 +4,7 @@ import {
   Eye, Palette, Music, Type, Flag, Zap, X, ChevronLeft, Play,
   RotateCcw, ArrowRight, Check, AlertCircle, Volume2, Sparkles,
   Loader2, Crown, Settings, Database, Copy, ExternalLink,
-  ServerCrash, Wifi, Globe
+  ServerCrash, Wifi, Globe, Grid3x3, Calculator, Crosshair
 } from 'lucide-react';
 
 /* ============================================================
@@ -291,10 +291,19 @@ const GAMES = [
   { id: 'flag',      name: 'FLAG MASTER', tag: 'KNOWLEDGE', icon: Flag, accent: C.lime,
     desc: 'A flag flashes up. Four countries to choose from. Get ten right. Or don\'t.' },
   { id: 'reflex',    name: 'REFLEX', tag: 'SPEED', icon: Zap, accent: C.pink,
-    desc: 'Wait for green. Click. Your reaction time in milliseconds. Average over five rounds — lower is better.' }
+    desc: 'Wait for green. Click. Your reaction time in milliseconds. Average over five rounds — lower is better.' },
+  { id: 'echo',      name: 'ECHO', tag: 'MEMORY', icon: Grid3x3, accent: C.cyan,
+    desc: 'Four pads light up in sequence. Repeat it back. Each round adds one step. How long a chain can you hold?' },
+  { id: 'math',      name: 'QUICK MATH', tag: 'NUMBERS', icon: Calculator, accent: C.lime,
+    desc: 'Rapid-fire arithmetic. Four answers, one\'s right. Bank as many as you can before the 30-second clock dies.' },
+  { id: 'bullseye',  name: 'BULLSEYE', tag: 'AIM', icon: Crosshair, accent: C.pink,
+    desc: 'Targets pop up. Shoot them down. Twenty seconds, one cursor, no mercy. Count your hits.' }
 ];
 
-const HIGHER_BETTER = { colorhunt: true, recall: true, pitch: true, wordlet: true, flag: true, reflex: false };
+const HIGHER_BETTER = {
+  colorhunt: true, recall: true, pitch: true, wordlet: true, flag: true, reflex: false,
+  echo: true, math: true, bullseye: true
+};
 
 const fmtScore = (game, v) => {
   if (v == null) return '—';
@@ -1267,7 +1276,8 @@ function GameRouter({ route, onExit, onScore, scores }) {
   };
   const Comp = {
     colorhunt: ColorHunt, recall: ChromaticRecall, pitch: PitchPerfect,
-    wordlet: Wordlet, flag: FlagMaster, reflex: Reflex
+    wordlet: Wordlet, flag: FlagMaster, reflex: Reflex,
+    echo: Echo, math: QuickMath, bullseye: Bullseye
   }[route];
   return (
     <GameShell game={g} onExit={onExit} best={scores[route]?.best}>
@@ -1869,22 +1879,69 @@ const WORDS = [
   'wrote','yacht','yards','yeast','yield','young','youth','zebra','zonal','zones'
 ];
 
+const WORD_SET = new Set(WORDS);
+
+// Two-pass Wordle coloring that respects letter counts, so a letter that
+// appears once in the target can't light up twice in a guess.
+function scoreRow(guess, target) {
+  const res = Array(5).fill('gray');
+  const counts = {};
+  for (const ch of target) counts[ch] = (counts[ch] || 0) + 1;
+  for (let i = 0; i < 5; i++) {
+    if (guess[i] === target[i]) { res[i] = 'green'; counts[guess[i]]--; }
+  }
+  for (let i = 0; i < 5; i++) {
+    if (res[i] === 'green') continue;
+    const ch = guess[i];
+    if (counts[ch] > 0) { res[i] = 'amber'; counts[ch]--; }
+  }
+  return res;
+}
+
+// Validate a guess. Known answers pass instantly; everything else is checked
+// against a free dictionary API. Fails OPEN (accepts) on network errors so the
+// game is never bricked if the API is down or the user is offline.
+async function isRealWord(w) {
+  const lw = w.toLowerCase();
+  if (WORD_SET.has(lw)) return true;
+  try {
+    const r = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${lw}`);
+    if (r.status === 404) return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 function Wordlet({ onScore, accent }) {
   const [target, setTarget] = useState(() => pick(WORDS).toUpperCase());
   const [guesses, setGuesses] = useState([]);
   const [cur, setCur] = useState('');
   const [phase, setPhase] = useState('play');
+  const [checking, setChecking] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [shakeN, setShakeN] = useState(0);
   const MAX = 6;
   const submittedRef = useRef(false);
 
   const reset = () => {
     setTarget(pick(WORDS).toUpperCase()); setGuesses([]); setCur('');
-    setPhase('play'); submittedRef.current = false;
+    setPhase('play'); setNotice(''); submittedRef.current = false;
   };
 
-  const submit = useCallback(() => {
-    if (cur.length !== 5) { sfx.warn(); return; }
-    if (!/^[A-Z]{5}$/.test(cur)) { sfx.warn(); return; }
+  const flashInvalid = (msg) => {
+    setNotice(msg); setShakeN(n => n + 1);
+    setTimeout(() => setNotice(n => (n === msg ? '' : n)), 1300);
+  };
+
+  const submit = useCallback(async () => {
+    if (phase !== 'play' || checking) return;
+    if (cur.length !== 5) { sfx.warn(); flashInvalid('NEEDS 5 LETTERS'); return; }
+    setChecking(true);
+    const ok = await isRealWord(cur);
+    setChecking(false);
+    if (!ok) { sfx.bad(); flashInvalid('NOT IN WORD LIST'); return; }
+
     const newGuesses = [...guesses, cur];
     setGuesses(newGuesses); setCur('');
     if (cur === target) {
@@ -1894,7 +1951,7 @@ function Wordlet({ onScore, accent }) {
       sfx.bad(); setPhase('lose');
       if (!submittedRef.current) { submittedRef.current = true; onScore(0); }
     } else { sfx.click(); }
-  }, [cur, guesses, target, onScore]);
+  }, [cur, guesses, target, onScore, phase, checking]);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -1908,22 +1965,21 @@ function Wordlet({ onScore, accent }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [submit, phase]);
 
-  const tile = (ch, i, row) => {
-    if (!row) return { color: C.text, bg: C.bg2, border: ch ? C.borderLight : C.border };
-    const t = target[i];
-    if (ch === t) return { color: C.bg, bg: C.lime, border: C.lime };
-    if (target.includes(ch)) return { color: C.bg, bg: C.amber, border: C.amber };
-    return { color: C.text, bg: C.bg3, border: C.border };
+  const colorFor = (state, hasCh) => {
+    if (state === 'green') return { color: C.bg, bg: C.lime, border: C.lime };
+    if (state === 'amber') return { color: C.bg, bg: C.amber, border: C.amber };
+    if (state === 'gray')  return { color: C.text, bg: C.bg3, border: C.border };
+    return { color: C.text, bg: C.bg2, border: hasCh ? C.borderLight : C.border };
   };
 
   const keyState = useMemo(() => {
     const m = {};
+    const rank = { gray: 0, amber: 1, green: 2 };
     for (const g of guesses) {
+      const sc = scoreRow(g, target);
       for (let i = 0; i < 5; i++) {
-        const ch = g[i];
-        if (ch === target[i]) m[ch] = 'green';
-        else if (target.includes(ch)) m[ch] = m[ch] === 'green' ? 'green' : 'amber';
-        else m[ch] = m[ch] || 'gray';
+        const ch = g[i], st = sc[i];
+        if (m[ch] == null || rank[st] > rank[m[ch]]) m[ch] = st;
       }
     }
     return m;
@@ -1940,15 +1996,18 @@ function Wordlet({ onScore, accent }) {
 
   return (
     <div style={{ maxWidth:520, margin:'0 auto' }}>
-      <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:24, alignItems:'center' }}>
+      <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:16, alignItems:'center' }}>
         {Array.from({ length: MAX }).map((_, ri) => {
           const isCurrent = ri === guesses.length && phase === 'play';
           const row = ri < guesses.length ? guesses[ri] : null;
+          const rowScore = row ? scoreRow(row, target) : null;
           const text = row || (isCurrent ? cur.padEnd(5, ' ') : '     ');
           return (
-            <div key={ri} style={{ display:'flex', gap:6 }}>
+            <div key={isCurrent ? `cur-${shakeN}` : `row-${ri}`}
+              className={isCurrent && shakeN ? 'shake' : ''}
+              style={{ display:'flex', gap:6 }}>
               {Array.from(text).map((ch, i) => {
-                const s = tile(ch.trim() || '', i, row);
+                const s = colorFor(rowScore ? rowScore[i] : null, ch.trim());
                 return (
                   <div key={i} className={row ? 'flip-in' : ''}
                     style={{
@@ -1966,12 +2025,23 @@ function Wordlet({ onScore, accent }) {
         })}
       </div>
 
+      <div style={{ height:22, textAlign:'center', marginBottom:8 }}>
+        {notice && (
+          <span style={{ fontSize:11, letterSpacing:2, color:C.pink, fontWeight:600 }}>{notice}</span>
+        )}
+        {!notice && checking && (
+          <span style={{ fontSize:11, letterSpacing:2, color:C.textDim }}>CHECKING<span className="blink">_</span></span>
+        )}
+      </div>
+
       {phase === 'play' && (
         <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
           {rows.map((r, ri) => (
             <div key={ri} style={{ display:'flex', gap:5, justifyContent:'center' }}>
               {ri === 2 && (
-                <button onClick={() => press('ENT')} onMouseEnter={sfx.hover} style={kbBtnStyle({}, 'wide')}>ENTR</button>
+                <button onClick={() => press('ENT')} onMouseEnter={sfx.hover} style={kbBtnStyle({}, 'wide')}>
+                  {checking ? '···' : 'ENTR'}
+                </button>
               )}
               {Array.from(r).map(k => {
                 const st = keyState[k];
@@ -2224,6 +2294,353 @@ function Reflex({ onScore, accent }) {
         }}>
         {s.text}
       </button>
+    </div>
+  );
+}
+
+/* ============================================================
+   GAME 7: ECHO  (sequence memory — watch & repeat)
+   ============================================================ */
+
+const ECHO_PADS = [
+  { color: C.lime, freq: 329.63 }, // E4
+  { color: C.pink, freq: 415.30 }, // G#4
+  { color: C.cyan, freq: 493.88 }, // B4
+  { color: C.amber, freq: 622.25 } // D#5
+];
+
+function Echo({ onScore, accent }) {
+  const [phase, setPhase] = useState('idle'); // idle, watch, repeat, over
+  const [seq, setSeq] = useState([]);
+  const [lit, setLit] = useState(-1);
+  const [step, setStep] = useState(0);   // how far through the repeat the player is
+  const [best, setBest] = useState(0);
+  const submittedRef = useRef(false);
+  const timers = useRef([]);
+
+  const clearTimers = () => { timers.current.forEach(clearTimeout); timers.current = []; };
+  useEffect(() => () => clearTimers(), []);
+
+  const flash = (padIdx) => {
+    const p = ECHO_PADS[padIdx];
+    setLit(padIdx);
+    tone(p.freq, 0.32, 'triangle', 0.10);
+    timers.current.push(setTimeout(() => setLit(-1), 320));
+  };
+
+  const playSequence = (full) => {
+    setPhase('watch');
+    clearTimers();
+    full.forEach((padIdx, i) => {
+      timers.current.push(setTimeout(() => flash(padIdx), 650 * i + 300));
+    });
+    timers.current.push(setTimeout(() => { setPhase('repeat'); setStep(0); }, 650 * full.length + 400));
+  };
+
+  const start = () => {
+    submittedRef.current = false;
+    const first = [randInt(0, 3)];
+    setSeq(first); setBest(0);
+    playSequence(first);
+  };
+
+  const nextRound = (prev) => {
+    const next = [...prev, randInt(0, 3)];
+    setSeq(next);
+    playSequence(next);
+  };
+
+  const tapPad = (padIdx) => {
+    if (phase !== 'repeat') return;
+    flash(padIdx);
+    if (padIdx === seq[step]) {
+      const ns = step + 1;
+      if (ns === seq.length) {
+        // round cleared
+        const cleared = seq.length;
+        setBest(cleared);
+        sfx.good();
+        timers.current.push(setTimeout(() => nextRound(seq), 600));
+      } else {
+        setStep(ns);
+      }
+    } else {
+      // wrong — game over. Score = how many full rounds completed (= seq.length - 1).
+      sfx.bad();
+      const finalScore = seq.length - 1;
+      setBest(finalScore);
+      if (!submittedRef.current) { submittedRef.current = true; onScore(finalScore); }
+      setPhase('over');
+    }
+  };
+
+  if (phase === 'idle') {
+    return <PrePlay accent={accent} icon={Grid3x3} how={[
+      'Four pads. Each has its own colour and tone.',
+      'Watch the sequence light up, then tap it back in order.',
+      'Clear a round and it adds one more step.',
+      'One wrong tap ends it. Your score is the longest chain you completed.'
+    ]} onStart={start}/>;
+  }
+  if (phase === 'over') {
+    return <Result accent={accent} title="CHAIN BROKEN" lines={[['LONGEST CHAIN', best]]} onRetry={start}/>;
+  }
+
+  return (
+    <div>
+      <Hud accent={accent} items={[
+        ['CHAIN', seq.length],
+        ['STATUS', phase === 'watch' ? 'WATCH' : 'REPEAT', phase === 'repeat' ? accent : C.amber],
+        ['PROGRESS', `${step}/${seq.length}`]
+      ]}/>
+      <div style={{
+        display:'grid', gridTemplateColumns:'1fr 1fr', gap:14,
+        maxWidth:440, margin:'28px auto 0', aspectRatio:'1 / 1'
+      }}>
+        {ECHO_PADS.map((p, idx) => (
+          <button key={idx}
+            disabled={phase !== 'repeat'}
+            onClick={() => tapPad(idx)}
+            style={{
+              border:`2px solid ${p.color}`,
+              background: lit === idx ? p.color : `${p.color}1a`,
+              cursor: phase === 'repeat' ? 'pointer' : 'default',
+              transition:'background 90ms, transform 90ms',
+              transform: lit === idx ? 'scale(0.97)' : 'scale(1)',
+              boxShadow: lit === idx ? `0 0 40px ${p.color}99` : 'none'
+            }}/>
+        ))}
+      </div>
+      <div style={{ textAlign:'center', marginTop:20, fontSize:11, letterSpacing:2, color:C.textDim }}>
+        {phase === 'watch' ? 'MEMORIZE THE PATTERN' : 'YOUR TURN — TAP IT BACK'}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   GAME 8: QUICK MATH  (arithmetic blitz, 30s, multiple choice)
+   ============================================================ */
+
+function makeProblem() {
+  const ops = ['+', '-', '×'];
+  const op = pick(ops);
+  let a, b, ans;
+  if (op === '+') { a = randInt(2, 49); b = randInt(2, 49); ans = a + b; }
+  else if (op === '-') { a = randInt(10, 60); b = randInt(1, a); ans = a - b; }
+  else { a = randInt(2, 12); b = randInt(2, 12); ans = a * b; }
+  // build 3 plausible wrong answers
+  const opts = new Set([ans]);
+  while (opts.size < 4) {
+    const delta = randInt(1, Math.max(4, Math.round(ans * 0.2) + 2));
+    const wrong = ans + (Math.random() < 0.5 ? -delta : delta);
+    if (wrong >= 0 && wrong !== ans) opts.add(wrong);
+  }
+  const choices = [...opts].sort(() => Math.random() - 0.5);
+  return { text: `${a} ${op} ${b}`, ans, choices };
+}
+
+function QuickMath({ onScore, accent }) {
+  const [phase, setPhase] = useState('idle'); // idle, playing, over
+  const [time, setTime] = useState(30);
+  const [prob, setProb] = useState(null);
+  const [score, setScore] = useState(0);
+  const [streak, setStreak] = useState(0);
+  const [flash, setFlash] = useState(null); // {ok, idx}
+  const tref = useRef(null);
+  const submittedRef = useRef(false);
+
+  const start = () => {
+    setScore(0); setStreak(0); setTime(30); setProb(makeProblem());
+    setFlash(null); submittedRef.current = false; setPhase('playing');
+  };
+
+  useEffect(() => {
+    if (phase !== 'playing') return;
+    tref.current = setInterval(() => {
+      setTime(t => {
+        if (t <= 1) { clearInterval(tref.current); return 0; }
+        if (t <= 5) sfx.tick();
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(tref.current);
+  }, [phase]);
+
+  useEffect(() => {
+    if (phase === 'playing' && time === 0) {
+      if (!submittedRef.current) { submittedRef.current = true; onScore(score); }
+      sfx.bad(); setPhase('over');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [time, phase]);
+
+  const answer = (val, idx) => {
+    if (phase !== 'playing' || flash) return;
+    const ok = val === prob.ans;
+    setFlash({ ok, idx });
+    if (ok) { sfx.pick(); setScore(s => s + 1); setStreak(s => s + 1); }
+    else { sfx.bad(); setStreak(0); }
+    setTimeout(() => { setFlash(null); setProb(makeProblem()); }, ok ? 180 : 420);
+  };
+
+  if (phase === 'idle') {
+    return <PrePlay accent={accent} icon={Calculator} how={[
+      'A problem appears with four possible answers.',
+      'Tap the right one. A new problem appears instantly.',
+      'Every correct answer is a point. Wrong ones break your streak.',
+      'Score as many as you can in 30 seconds.'
+    ]} onStart={start}/>;
+  }
+  if (phase === 'over') {
+    return <Result accent={accent} title="TIME UP" lines={[['SOLVED', score]]} onRetry={start}/>;
+  }
+
+  return (
+    <div>
+      <Hud accent={accent} items={[
+        ['TIME', `${time}s`, time <= 5 ? C.pink : null],
+        ['SCORE', score],
+        ['STREAK', streak, streak >= 5 ? accent : null]
+      ]}/>
+      <div style={{ maxWidth:520, margin:'32px auto 0', textAlign:'center' }}>
+        <div style={{
+          fontFamily:FONT_DISPLAY, fontWeight:800, fontSize:72, letterSpacing:-2,
+          padding:'24px', border:`1px solid ${C.border}`, background:C.bg2, marginBottom:20
+        }}>
+          {prob.text}
+        </div>
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+          {prob.choices.map((c, i) => {
+            let bg = C.bg2, border = C.border, color = C.text;
+            if (flash && flash.idx === i) {
+              if (flash.ok) { bg = C.lime; border = C.lime; color = C.bg; }
+              else { bg = C.pink; border = C.pink; color = C.bg; }
+            } else if (flash && c === prob.ans) {
+              border = C.lime; color = C.lime;
+            }
+            return (
+              <button key={i} disabled={!!flash} onClick={() => answer(c, i)}
+                onMouseEnter={() => !flash && sfx.hover()}
+                style={{
+                  padding:'22px', fontFamily:FONT_MONO, fontWeight:700, fontSize:28,
+                  background:bg, border:`1px solid ${border}`, color, cursor: flash ? 'default' : 'pointer',
+                  transition:'background 120ms, border 120ms, color 120ms'
+                }}>
+                {c}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   GAME 9: BULLSEYE  (aim trainer — pop targets in 20s)
+   ============================================================ */
+
+function Bullseye({ onScore, accent }) {
+  const [phase, setPhase] = useState('idle'); // idle, playing, over
+  const [time, setTime] = useState(20);
+  const [hits, setHits] = useState(0);
+  const [misses, setMisses] = useState(0);
+  const [target, setTarget] = useState(null); // {x, y, r}
+  const tref = useRef(null);
+  const areaRef = useRef(null);
+  const submittedRef = useRef(false);
+
+  const spawn = () => {
+    const pad = 14; // percent padding so targets aren't half off-edge
+    setTarget({
+      x: rand(pad, 100 - pad),
+      y: rand(pad, 100 - pad),
+      r: randInt(26, 46) // px radius
+    });
+  };
+
+  const start = () => {
+    setHits(0); setMisses(0); setTime(20); submittedRef.current = false;
+    setPhase('playing'); spawn();
+  };
+
+  useEffect(() => {
+    if (phase !== 'playing') return;
+    tref.current = setInterval(() => {
+      setTime(t => {
+        if (t <= 1) { clearInterval(tref.current); return 0; }
+        if (t <= 5) sfx.tick();
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(tref.current);
+  }, [phase]);
+
+  useEffect(() => {
+    if (phase === 'playing' && time === 0) {
+      if (!submittedRef.current) { submittedRef.current = true; onScore(hits); }
+      sfx.bad(); setTarget(null); setPhase('over');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [time, phase]);
+
+  const hitTarget = (e) => {
+    e.stopPropagation();
+    if (phase !== 'playing') return;
+    sfx.pick();
+    setHits(h => h + 1);
+    spawn();
+  };
+
+  const missArea = () => {
+    if (phase !== 'playing') return;
+    sfx.warn();
+    setMisses(m => m + 1);
+  };
+
+  if (phase === 'idle') {
+    return <PrePlay accent={accent} icon={Crosshair} how={[
+      'A target appears somewhere in the arena.',
+      'Click it as fast as you can — a new one instantly pops up elsewhere.',
+      'Clicking empty space counts as a miss (just for your accuracy stat).',
+      'You have 20 seconds. Rack up as many hits as possible.'
+    ]} onStart={start}/>;
+  }
+  if (phase === 'over') {
+    const total = hits + misses;
+    const acc = total ? Math.round((hits / total) * 100) : 100;
+    return <Result accent={accent} title="TIME UP" lines={[
+      ['HITS', hits],
+      ['ACCURACY', `${acc}%`]
+    ]} onRetry={start}/>;
+  }
+
+  return (
+    <div>
+      <Hud accent={accent} items={[
+        ['TIME', `${time}s`, time <= 5 ? C.pink : null],
+        ['HITS', hits],
+        ['MISSES', misses, misses ? C.pink : null]
+      ]}/>
+      <div ref={areaRef} onMouseDown={missArea}
+        style={{
+          position:'relative', maxWidth:640, height:420, margin:'24px auto 0',
+          border:`1px solid ${C.border}`, background:C.bg2, overflow:'hidden', cursor:'crosshair',
+          userSelect:'none'
+        }}>
+        {target && (
+          <button onMouseDown={hitTarget}
+            style={{
+              position:'absolute', left:`${target.x}%`, top:`${target.y}%`,
+              width:target.r * 2, height:target.r * 2, transform:'translate(-50%, -50%)',
+              borderRadius:'50%', border:`3px solid ${accent}`, background:`${accent}22`,
+              cursor:'crosshair', display:'grid', placeItems:'center'
+            }}>
+            <span style={{ width:'40%', height:'40%', borderRadius:'50%', background:accent }}/>
+          </button>
+        )}
+      </div>
     </div>
   );
 }
